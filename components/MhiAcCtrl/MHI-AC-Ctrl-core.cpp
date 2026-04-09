@@ -3,6 +3,32 @@
 
 #include "MHI-AC-Ctrl-core.h"
 
+#ifdef ESP8266
+#include <c_types.h>
+#include <ets_sys.h>
+
+// Safety-net definitions in case the Arduino core headers don't provide these
+#ifndef xt_rsil
+#define xt_rsil(level) (__extension__({uint32_t state; \
+  __asm__ __volatile__("rsil %0," __STRINGIFY(level) : "=a" (state)); state;}))
+#endif
+#ifndef xt_wsr_ps
+#define xt_wsr_ps(state) __asm__ __volatile__("wsr %0,ps; isync" :: "a" (state))
+#endif
+
+// Direct GPIO register access (~100ns vs ~3-5µs for digitalRead/digitalWrite)
+#define MHI_GPIO_IN    (*(volatile uint32_t*)0x60000318)
+#define MHI_GPIO_SET   (*(volatile uint32_t*)0x60000304)
+#define MHI_GPIO_CLR   (*(volatile uint32_t*)0x60000308)
+
+// CPU cycle counter — works even when interrupts are blocked (millis() doesn't)
+#define MHI_GET_CCOUNT() (__extension__({uint32_t c; \
+  __asm__ __volatile__("rsr %0,ccount" : "=a" (c)); c;}))
+
+#endif // ESP8266
+
+volatile bool ota_in_progress = false;
+
 uint16_t calc_checksum(byte* frame) {
   uint16_t checksum = 0;
   for (int i = 0; i < CBH; i++)
@@ -236,8 +262,71 @@ static byte MOSI_frame[33];
   //Serial.println();
   //Serial.print(F("MISO:"));
   // read/write MOSI/MISO frame
+#ifdef ESP8266
+  // --- NMI-hardened SPI exchange for ESP8266 ---
+  // Block ALL interrupts (including WiFi NMI) during the bit-bang loop to prevent
+  // missed SCK edges. Uses direct GPIO registers and CCOUNT for timeout since
+  // digitalRead/digitalWrite and millis() are too slow / depend on interrupts.
+  {
+    const uint32_t sck_mask  = (1 << SCK_PIN);
+    const uint32_t mosi_mask = (1 << MOSI_PIN);
+    const uint32_t miso_mask = (1 << MISO_PIN);
+    const uint32_t timeout_cycles = max_time_ms * 160000UL;  // 160MHz CPU
+    const uint32_t start_ccount = MHI_GET_CCOUNT();
+    uint32_t saved_ps = 0;
+    int err = 0;
+
+    if (!ota_in_progress) {
+      saved_ps = xt_rsil(15);  // block everything including NMI
+    }
+
+    for (uint8_t byte_cnt = 0; byte_cnt < frameSize; byte_cnt++) {
+      MOSI_byte = 0;
+      byte bit_mask = 1;
+      for (uint8_t bit_cnt = 0; bit_cnt < 8; bit_cnt++) {
+        // Wait for SCK falling edge
+        while (MHI_GPIO_IN & sck_mask) {
+          if ((MHI_GET_CCOUNT() - start_ccount) > timeout_cycles) {
+            err = err_msg_timeout_SCK_high;
+            goto esp8266_exit;
+          }
+        }
+        // Set MISO output
+        if (MISO_frame[byte_cnt] & bit_mask)
+          MHI_GPIO_SET = miso_mask;
+        else
+          MHI_GPIO_CLR = miso_mask;
+        // Wait for SCK rising edge
+        while (!(MHI_GPIO_IN & sck_mask)) {
+          if ((MHI_GET_CCOUNT() - start_ccount) > timeout_cycles) {
+            err = err_msg_timeout_SCK_low;
+            goto esp8266_exit;
+          }
+        }
+        // Sample MOSI input
+        if (MHI_GPIO_IN & mosi_mask)
+          MOSI_byte += bit_mask;
+        bit_mask = bit_mask << 1;
+      }
+      if (MOSI_frame[byte_cnt] != MOSI_byte) {
+        new_datapacket_received = true;
+        MOSI_frame[byte_cnt] = MOSI_byte;
+      }
+    }
+
+esp8266_exit:
+    if (!ota_in_progress) {
+      xt_wsr_ps(saved_ps);  // restore interrupts
+    }
+    if (err)
+      return err;
+  }
+#else
+  // Original software SPI for ESP32 and other platforms.
+  // NOTE: ESP32/S3/C3 users experiencing -1/-2/-4 errors should consider switching
+  // to https://github.com/hberntsen/mhi-ac-ctrl-esp32 which uses hardware SPI slave
+  // + RMT for CS synthesis, eliminating this class of error entirely.
   for (uint8_t byte_cnt = 0; byte_cnt < frameSize; byte_cnt++) { // read and write a data packet of 20 bytes
-    //Serial.printf("x%02x ", MISO_frame[byte_cnt]);
     MOSI_byte = 0;
     byte bit_mask = 1;
     for (uint8_t bit_cnt = 0; bit_cnt < 8; bit_cnt++) { // read and write 1 byte
@@ -245,7 +334,7 @@ static byte MOSI_frame[33];
       while (digitalRead(SCK_PIN)) { // wait for falling edge
         if (millis() - startMillis > max_time_ms)
           return err_msg_timeout_SCK_high;       // SCK stuck@ high error detection
-      } 
+      }
       if ((MISO_frame[byte_cnt] & bit_mask) > 0)
         digitalWrite(MISO_PIN, 1);
       else
@@ -260,6 +349,7 @@ static byte MOSI_frame[33];
       MOSI_frame[byte_cnt] = MOSI_byte;
     }
   }
+#endif
 
   checksum = calc_checksum(MOSI_frame);
   if (((MOSI_frame[SB0] & 0xfe) != 0x6c) | (MOSI_frame[SB1] != 0x80) | (MOSI_frame[SB2] != 0x04))

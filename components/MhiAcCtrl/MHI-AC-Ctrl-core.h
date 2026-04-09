@@ -108,6 +108,8 @@ enum AC3Dauto {  // 3D auto enum
   Dauto_off = 0b00000000, Dauto_on = 0b00000100
 };
 
+extern volatile bool ota_in_progress;
+
 class CallbackInterface_Status {
   public: virtual void cbiStatusFunction(ACStatus status, int value) = 0;
 };
