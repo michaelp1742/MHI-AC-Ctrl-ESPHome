@@ -175,6 +175,24 @@ static byte MOSI_frame[33];
     if (millis() - startMillis > max_time_ms)
       return err_msg_timeout_SCK_low;       // SCK stuck@ low error detection
   }
+
+#ifdef ESP8266
+  // Block ALL interrupts (including WiFi NMI) from here through the end of the
+  // SPI bit-bang exchange. This covers both MISO frame assembly and the bit-bang
+  // loop, eliminating the vulnerability window between frame-start detection and
+  // the first SCK edge. The MISO assembly is pure computation (array writes,
+  // pgm_read_word, arithmetic) — no interrupt-dependent calls.
+  const uint32_t sck_mask  = (1 << SCK_PIN);
+  const uint32_t mosi_mask = (1 << MOSI_PIN);
+  const uint32_t miso_mask = (1 << MISO_PIN);
+  const uint32_t timeout_cycles = max_time_ms * 160000UL;  // 160MHz CPU
+  uint32_t saved_ps = 0;
+
+  if (!ota_in_progress) {
+    saved_ps = xt_rsil(15);  // block everything including NMI
+  }
+#endif
+
   // build the next MISO frame
 
   doubleframe = !doubleframe;             // toggle every frame
@@ -264,21 +282,12 @@ static byte MOSI_frame[33];
   // read/write MOSI/MISO frame
 #ifdef ESP8266
   // --- NMI-hardened SPI exchange for ESP8266 ---
-  // Block ALL interrupts (including WiFi NMI) during the bit-bang loop to prevent
-  // missed SCK edges. Uses direct GPIO registers and CCOUNT for timeout since
-  // digitalRead/digitalWrite and millis() are too slow / depend on interrupts.
+  // NMI is already blocked from before MISO frame assembly.
+  // Uses direct GPIO registers and CCOUNT for timeout since
+  // digitalRead/digitalWrite and millis() depend on interrupts.
   {
-    const uint32_t sck_mask  = (1 << SCK_PIN);
-    const uint32_t mosi_mask = (1 << MOSI_PIN);
-    const uint32_t miso_mask = (1 << MISO_PIN);
-    const uint32_t timeout_cycles = max_time_ms * 160000UL;  // 160MHz CPU
     const uint32_t start_ccount = MHI_GET_CCOUNT();
-    uint32_t saved_ps = 0;
     int err = 0;
-
-    if (!ota_in_progress) {
-      saved_ps = xt_rsil(15);  // block everything including NMI
-    }
 
     for (uint8_t byte_cnt = 0; byte_cnt < frameSize; byte_cnt++) {
       MOSI_byte = 0;
@@ -321,6 +330,7 @@ esp8266_exit:
     if (err)
       return err;
   }
+  // NMI restored above on all paths (normal completion and error)
 #else
   // Original software SPI for ESP32 and other platforms.
   // NOTE: ESP32/S3/C3 users experiencing -1/-2/-4 errors should consider switching
