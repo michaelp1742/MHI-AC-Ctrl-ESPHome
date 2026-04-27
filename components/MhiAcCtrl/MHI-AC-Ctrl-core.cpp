@@ -163,41 +163,24 @@ static byte MOSI_frame[33];
 
   static uint call_counter = 0;           // counts how often this loop was called
   static unsigned long lastTroomInternalMillis = 0; // remember when Troom internal has changed
+#ifdef ESP8266
+  // Timing anchor for race-free frame-start detection (Path B). Captured at end
+  // of each successful bit-bang (Phase F); the next call predicts the AC's next
+  // frame start from CCOUNT instead of polling SCK during the inter-frame gap.
+  static uint32_t last_frame_end_ccount = 0;
+  static bool last_frame_end_valid = false;
+#endif
   if (frameSize == 33)
     MISO_frame[0] = 0xAA;
 
    
   call_counter++;
-  int SCKMillis = millis();               // time of last SCK low level
-  while (millis() - SCKMillis < 5) {      // wait for 5ms stable high signal to detect a frame start
-    if (!digitalRead(SCK_PIN))
-      SCKMillis = millis();
-    if (millis() - startMillis > max_time_ms)
-      return err_msg_timeout_SCK_low;       // SCK stuck@ low error detection
-  }
-
-#ifdef ESP8266
-  // Block ALL interrupts (including WiFi NMI) from here through the end of the
-  // SPI bit-bang exchange. This covers both MISO frame assembly and the bit-bang
-  // loop, eliminating the vulnerability window between frame-start detection and
-  // the first SCK edge. The MISO assembly is pure computation (array writes,
-  // pgm_read_word, arithmetic) — no interrupt-dependent calls.
-  const uint32_t sck_mask  = (1 << SCK_PIN);
-  const uint32_t mosi_mask = (1 << MOSI_PIN);
-  const uint32_t miso_mask = (1 << MISO_PIN);
-  const uint32_t timeout_cycles = max_time_ms * 160000UL;  // 160MHz CPU
-  uint32_t saved_ps = 0;
-
-  if (!ota_in_progress) {
-    saved_ps = xt_rsil(15);  // block everything including NMI
-  }
-#endif
-
-  // build the next MISO frame
-
+  // === Phase A — Build MISO frame (NMI free) ===
+  // Pure computation; safe to run before frame-start detection because the
+  // timing anchor (Phase F) is the source of truth for frame sync.
   doubleframe = !doubleframe;             // toggle every frame
   MISO_frame[DB14] = doubleframe << 2;    // MISO_frame[DB14] bit2 toggles with every frame
-  
+
   // Requesting all different opdata's is an opdata cycle. A cycle will take 20s.
   // With the current 20 different opdata's, every opdata request will take 1sec (interval).
   // If there are only 5 different opdata's defined, these 5 will be spread about the 20s cycle. The interval will increase.
@@ -219,9 +202,9 @@ static byte MOSI_frame[33];
   else  // reset OpData request
   {
     MISO_frame[DB6] = 0x80;
-    MISO_frame[DB9] = 0xff;    
+    MISO_frame[DB9] = 0xff;
   }
-  
+
   if (doubleframe) {                        // and the other MISO data changes are updated when MISO_frame[DB14] bit2 is set
     MISO_frame[DB0] = 0x00;
     MISO_frame[DB1] = 0x00;
@@ -268,7 +251,7 @@ static byte MOSI_frame[33];
     MISO_frame[DB16] = 0;
     MISO_frame[DB16] |= new_VanesLR1;
     MISO_frame[DB17] = 0;
-    MISO_frame[DB17] |= new_VanesLR0;  
+    MISO_frame[DB17] |= new_VanesLR0;
     MISO_frame[DB17] |= new_3Dauto;
     new_3Dauto = 0;
     new_VanesLR0 = 0;
@@ -277,42 +260,155 @@ static byte MOSI_frame[33];
     checksum = calc_checksumFrame33(MISO_frame);
     MISO_frame[CBL2] = lowByte(checksum);
   }
-  //Serial.println();
-  //Serial.print(F("MISO:"));
-  // read/write MOSI/MISO frame
+
 #ifdef ESP8266
-  // --- NMI-hardened SPI exchange for ESP8266 ---
-  // NMI is already blocked from before MISO frame assembly.
-  // Uses direct GPIO registers and CCOUNT for timeout since
-  // digitalRead/digitalWrite and millis() depend on interrupts.
+  // === Phase B — Pick entry mode (tracking or recovery) ===
+  // Constants in CPU cycles at 160 MHz (see plan for rationale).
+  const uint32_t GAP_25_PCT_CYCLES       = 1600000UL;  // 10 ms
+  const uint32_t GAP_FULL_CYCLES         = 6400000UL;  // 40 ms
+  const uint32_t RECOVERY_SLACK          = 1600000UL;  // 10 ms
+  const uint32_t NMI_LEAD_CYCLES         =  160000UL;  //  1 ms
+  const uint32_t FALL_TIMEOUT_CYCLES     = 5600000UL;  // 35 ms
+  const uint32_t BIT_BANG_TIMEOUT_CYCLES = 4000000UL;  // 25 ms
+
+  const uint32_t sck_mask  = (1 << SCK_PIN);
+  const uint32_t mosi_mask = (1 << MOSI_PIN);
+  const uint32_t miso_mask = (1 << MISO_PIN);
+  uint32_t saved_ps = 0;
+
+  if (last_frame_end_valid) {
+    // Tracking mode: anchor valid, predict next falling edge from CCOUNT.
+    uint32_t since_gap_start = MHI_GET_CCOUNT() - last_frame_end_ccount;
+
+    if (since_gap_start < GAP_25_PCT_CYCLES) {
+      return 0;  // too early in gap; yield to ESPHome (not an error)
+    }
+    if (since_gap_start > GAP_FULL_CYCLES + RECOVERY_SLACK) {
+      last_frame_end_valid = false;
+      return 0;  // anchor stale; recovery on next call
+    }
+    uint32_t cycles_until_edge = GAP_FULL_CYCLES - since_gap_start;
+    if (cycles_until_edge > NMI_LEAD_CYCLES) {
+      return 0;  // not yet in lead window; yield
+    }
+    // Spin-wait (NMI free) to lead point ~1 ms before predicted falling edge.
+    uint32_t target = last_frame_end_ccount + GAP_FULL_CYCLES - NMI_LEAD_CYCLES;
+    while ((int32_t)(MHI_GET_CCOUNT() - target) < 0) {
+      // spin; NMI fires freely
+    }
+    // fall through to Phase C
+  } else {
+    // Recovery mode: existing 5 ms stable-high detection (NMI free).
+    int SCKMillis = millis();
+    while (millis() - SCKMillis < 5) {
+      if (!digitalRead(SCK_PIN))
+        SCKMillis = millis();
+      if (millis() - startMillis > max_time_ms)
+        return err_msg_timeout_SCK_low;
+    }
+    // fall through to Phase C
+  }
+
+  // === Phase C — Block NMI, verify SCK still high ===
+  if (!ota_in_progress) {
+    saved_ps = xt_rsil(15);
+  }
+  if (!(MHI_GPIO_IN & sck_mask)) {
+    // SCK already low: NMI fired between Phase B end and xt_rsil, or anchor
+    // mispredicted. Don't send garbage MISO; recover next call.
+    if (!ota_in_progress) xt_wsr_ps(saved_ps);
+    last_frame_end_valid = false;
+    return err_msg_invalid_signature;
+  }
+
+  // === Phase D — Wait for actual SCK falling edge (NMI blocked) ===
   {
-    const uint32_t start_ccount = MHI_GET_CCOUNT();
+    const uint32_t fall_start = MHI_GET_CCOUNT();
+    while (MHI_GPIO_IN & sck_mask) {
+      if ((MHI_GET_CCOUNT() - fall_start) > FALL_TIMEOUT_CYCLES) {
+        if (!ota_in_progress) xt_wsr_ps(saved_ps);
+        last_frame_end_valid = false;
+        return err_msg_timeout_SCK_high;
+      }
+    }
+  }
+
+  // === Phase E — Bit-bang exchange (NMI blocked, capped at 25 ms) ===
+  // Byte 0 bit 0 is special: SCK falling edge already consumed in Phase D, so
+  // set MISO immediately and wait for the rising edge. All remaining bits use
+  // the normal falling-edge-first sequence.
+  {
+    const uint32_t bb_start = MHI_GET_CCOUNT();
     int err = 0;
 
-    for (uint8_t byte_cnt = 0; byte_cnt < frameSize; byte_cnt++) {
+    // --- byte 0, bit 0: falling edge already passed ---
+    {
+      MOSI_byte = 0;
+      byte bit_mask = 1;
+
+      if (MISO_frame[0] & bit_mask)
+        MHI_GPIO_SET = miso_mask;
+      else
+        MHI_GPIO_CLR = miso_mask;
+      while (!(MHI_GPIO_IN & sck_mask)) {
+        if ((MHI_GET_CCOUNT() - bb_start) > BIT_BANG_TIMEOUT_CYCLES) {
+          err = err_msg_timeout_SCK_low;
+          goto bb_exit;
+        }
+      }
+      if (MHI_GPIO_IN & mosi_mask)
+        MOSI_byte += bit_mask;
+      bit_mask = bit_mask << 1;
+
+      // --- byte 0, bits 1..7: normal sequence ---
+      for (uint8_t bit_cnt = 1; bit_cnt < 8; bit_cnt++) {
+        while (MHI_GPIO_IN & sck_mask) {
+          if ((MHI_GET_CCOUNT() - bb_start) > BIT_BANG_TIMEOUT_CYCLES) {
+            err = err_msg_timeout_SCK_high;
+            goto bb_exit;
+          }
+        }
+        if (MISO_frame[0] & bit_mask)
+          MHI_GPIO_SET = miso_mask;
+        else
+          MHI_GPIO_CLR = miso_mask;
+        while (!(MHI_GPIO_IN & sck_mask)) {
+          if ((MHI_GET_CCOUNT() - bb_start) > BIT_BANG_TIMEOUT_CYCLES) {
+            err = err_msg_timeout_SCK_low;
+            goto bb_exit;
+          }
+        }
+        if (MHI_GPIO_IN & mosi_mask)
+          MOSI_byte += bit_mask;
+        bit_mask = bit_mask << 1;
+      }
+      if (MOSI_frame[0] != MOSI_byte) {
+        new_datapacket_received = true;
+        MOSI_frame[0] = MOSI_byte;
+      }
+    }
+
+    // --- bytes 1..frameSize-1: normal bit-bang ---
+    for (uint8_t byte_cnt = 1; byte_cnt < frameSize; byte_cnt++) {
       MOSI_byte = 0;
       byte bit_mask = 1;
       for (uint8_t bit_cnt = 0; bit_cnt < 8; bit_cnt++) {
-        // Wait for SCK falling edge
         while (MHI_GPIO_IN & sck_mask) {
-          if ((MHI_GET_CCOUNT() - start_ccount) > timeout_cycles) {
+          if ((MHI_GET_CCOUNT() - bb_start) > BIT_BANG_TIMEOUT_CYCLES) {
             err = err_msg_timeout_SCK_high;
-            goto esp8266_exit;
+            goto bb_exit;
           }
         }
-        // Set MISO output
         if (MISO_frame[byte_cnt] & bit_mask)
           MHI_GPIO_SET = miso_mask;
         else
           MHI_GPIO_CLR = miso_mask;
-        // Wait for SCK rising edge
         while (!(MHI_GPIO_IN & sck_mask)) {
-          if ((MHI_GET_CCOUNT() - start_ccount) > timeout_cycles) {
+          if ((MHI_GET_CCOUNT() - bb_start) > BIT_BANG_TIMEOUT_CYCLES) {
             err = err_msg_timeout_SCK_low;
-            goto esp8266_exit;
+            goto bb_exit;
           }
         }
-        // Sample MOSI input
         if (MHI_GPIO_IN & mosi_mask)
           MOSI_byte += bit_mask;
         bit_mask = bit_mask << 1;
@@ -323,19 +419,30 @@ static byte MOSI_frame[33];
       }
     }
 
-esp8266_exit:
-    if (!ota_in_progress) {
-      xt_wsr_ps(saved_ps);  // restore interrupts
-    }
-    if (err)
-      return err;
+    // === Phase F — Capture new anchor, release NMI ===
+    last_frame_end_ccount = MHI_GET_CCOUNT();
+    last_frame_end_valid = true;
+    if (!ota_in_progress) xt_wsr_ps(saved_ps);
+    goto bb_done;
+
+  bb_exit:
+    if (!ota_in_progress) xt_wsr_ps(saved_ps);
+    last_frame_end_valid = false;
+    return err;
+  bb_done: ;
   }
-  // NMI restored above on all paths (normal completion and error)
 #else
   // Original software SPI for ESP32 and other platforms.
   // NOTE: ESP32/S3/C3 users experiencing -1/-2/-4 errors should consider switching
   // to https://github.com/hberntsen/mhi-ac-ctrl-esp32 which uses hardware SPI slave
   // + RMT for CS synthesis, eliminating this class of error entirely.
+  int SCKMillis = millis();               // time of last SCK low level
+  while (millis() - SCKMillis < 5) {      // wait for 5ms stable high signal to detect a frame start
+    if (!digitalRead(SCK_PIN))
+      SCKMillis = millis();
+    if (millis() - startMillis > max_time_ms)
+      return err_msg_timeout_SCK_low;       // SCK stuck@ low error detection
+  }
   for (uint8_t byte_cnt = 0; byte_cnt < frameSize; byte_cnt++) { // read and write a data packet of 20 bytes
     MOSI_byte = 0;
     byte bit_mask = 1;
@@ -362,15 +469,27 @@ esp8266_exit:
 #endif
 
   checksum = calc_checksum(MOSI_frame);
-  if (((MOSI_frame[SB0] & 0xfe) != 0x6c) | (MOSI_frame[SB1] != 0x80) | (MOSI_frame[SB2] != 0x04))
+  if (((MOSI_frame[SB0] & 0xfe) != 0x6c) | (MOSI_frame[SB1] != 0x80) | (MOSI_frame[SB2] != 0x04)) {
+#ifdef ESP8266
+    last_frame_end_valid = false;
+#endif
     return err_msg_invalid_signature;
-  if ((MOSI_frame[CBH] << 8 | MOSI_frame[CBL]) != checksum)
+  }
+  if ((MOSI_frame[CBH] << 8 | MOSI_frame[CBL]) != checksum) {
+#ifdef ESP8266
+    last_frame_end_valid = false;
+#endif
     return err_msg_invalid_checksum;
+  }
 
   if (frameSize == 33) { // Only for framesize 33 (WF-RAC)
     checksum = calc_checksumFrame33(MOSI_frame);
-    if ( MOSI_frame[CBL2] != lowByte(checksum ) ) 
+    if ( MOSI_frame[CBL2] != lowByte(checksum ) ) {
+#ifdef ESP8266
+      last_frame_end_valid = false;
+#endif
       return err_msg_invalid_checksum;
+    }
   }
 
   if (new_datapacket_received) {
