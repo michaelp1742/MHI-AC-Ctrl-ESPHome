@@ -169,6 +169,10 @@ static byte MOSI_frame[33];
   // frame start from CCOUNT instead of polling SCK during the inter-frame gap.
   static uint32_t last_frame_end_ccount = 0;
   static bool last_frame_end_valid = false;
+  // EMA-filtered estimate of the inter-frame gap (anchor → next falling edge).
+  // Initial 28 ms is a deliberate under-estimate so tracking works on the first
+  // attempt regardless of the AC's actual gap; Phase D measures and refines it.
+  static uint32_t learned_gap_cycles = 4480000UL;  // 28 ms
 #endif
   if (frameSize == 33)
     MISO_frame[0] = 0xAA;
@@ -265,38 +269,48 @@ static byte MOSI_frame[33];
   // === Phase B — Pick entry mode (tracking or recovery) ===
   // Constants in CPU cycles at 160 MHz (see plan for rationale).
   const uint32_t GAP_25_PCT_CYCLES       = 1600000UL;  // 10 ms
-  const uint32_t GAP_FULL_CYCLES         = 6400000UL;  // 40 ms
   const uint32_t RECOVERY_SLACK          = 1600000UL;  // 10 ms
   const uint32_t NMI_LEAD_CYCLES         =  160000UL;  //  1 ms
-  const uint32_t FALL_TIMEOUT_CYCLES     = 5600000UL;  // 35 ms
+  const uint32_t FALL_TIMEOUT_CYCLES     = 8000000UL;  // 50 ms (recovery exits at gap+5ms; cap must clear gap-5ms with margin)
   const uint32_t BIT_BANG_TIMEOUT_CYCLES = 4000000UL;  // 25 ms
+  // Sanity bounds for learned_gap_cycles updates from observed gaps.
+  const uint32_t LEARNED_GAP_MIN         = 4000000UL;  // 25 ms
+  const uint32_t LEARNED_GAP_MAX         = 7200000UL;  // 45 ms
 
   const uint32_t sck_mask  = (1 << SCK_PIN);
   const uint32_t mosi_mask = (1 << MOSI_PIN);
   const uint32_t miso_mask = (1 << MISO_PIN);
   uint32_t saved_ps = 0;
+  // Snapshot anchor before Phase F overwrites it; Phase D uses this to derive
+  // observed_gap when the entry was via tracking mode.
+  const uint32_t prev_anchor = last_frame_end_ccount;
+  bool entered_via_tracking = false;
 
   if (last_frame_end_valid) {
     // Tracking mode: anchor valid, predict next falling edge from CCOUNT.
+    entered_via_tracking = true;
     uint32_t since_gap_start = MHI_GET_CCOUNT() - last_frame_end_ccount;
 
     if (since_gap_start < GAP_25_PCT_CYCLES) {
       return 0;  // too early in gap; yield to ESPHome (not an error)
     }
-    if (since_gap_start > GAP_FULL_CYCLES + RECOVERY_SLACK) {
+    if (since_gap_start > learned_gap_cycles + RECOVERY_SLACK) {
       last_frame_end_valid = false;
       return 0;  // anchor stale; recovery on next call
     }
-    uint32_t cycles_until_edge = GAP_FULL_CYCLES - since_gap_start;
-    if (cycles_until_edge > NMI_LEAD_CYCLES) {
+    const uint32_t target = last_frame_end_ccount + learned_gap_cycles - NMI_LEAD_CYCLES;
+    const int32_t signed_until_target = (int32_t)(target - MHI_GET_CCOUNT());
+    if (signed_until_target > (int32_t)NMI_LEAD_CYCLES) {
       return 0;  // not yet in lead window; yield
     }
-    // Spin-wait (NMI free) to lead point ~1 ms before predicted falling edge.
-    uint32_t target = last_frame_end_ccount + GAP_FULL_CYCLES - NMI_LEAD_CYCLES;
-    while ((int32_t)(MHI_GET_CCOUNT() - target) < 0) {
-      // spin; NMI fires freely
+    if (signed_until_target > 0) {
+      // Spin briefly (NMI free) to lead point ~1 ms before predicted falling edge.
+      while ((int32_t)(MHI_GET_CCOUNT() - target) < 0) {
+        // spin; NMI fires freely
+      }
     }
-    // fall through to Phase C
+    // else: target already passed (learned_gap under-estimates actual);
+    // fall through to Phase C and let Phase D wait for the real edge.
   } else {
     // Recovery mode: existing 5 ms stable-high detection (NMI free).
     int SCKMillis = millis();
@@ -329,6 +343,15 @@ static byte MOSI_frame[33];
         if (!ota_in_progress) xt_wsr_ps(saved_ps);
         last_frame_end_valid = false;
         return err_msg_timeout_SCK_high;
+      }
+    }
+    // SCK just fell. If we entered via tracking, refine learned_gap_cycles
+    // from the actual anchor → fall interval. Sanity-check rejects bogus
+    // observations (e.g. multi-cycle drift after a recovery sequence).
+    if (entered_via_tracking) {
+      const uint32_t observed_gap = MHI_GET_CCOUNT() - prev_anchor;
+      if (observed_gap >= LEARNED_GAP_MIN && observed_gap <= LEARNED_GAP_MAX) {
+        learned_gap_cycles = (learned_gap_cycles * 7 + observed_gap) / 8;
       }
     }
   }
