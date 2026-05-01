@@ -200,9 +200,12 @@ static byte MOSI_frame[33];
   static uint32_t last_frame_end_ccount = 0;
   static bool last_frame_end_valid = false;
   // EMA-filtered estimate of the inter-frame gap (anchor → next falling edge).
-  // Initial 28 ms is a deliberate under-estimate so tracking works on the first
-  // attempt regardless of the AC's actual gap; Phase D measures and refines it.
-  static uint32_t learned_gap_cycles = 4480000UL;  // 28 ms
+  // Seeded at 50 ms — the WF-RAC observed gap on this unit is ~49 ms (run-6
+  // logs). Earlier 28 ms seed combined with a too-tight LEARNED_GAP_MAX of
+  // 45 ms meant every real observation was rejected and EMA stayed stuck
+  // ~7 ms below the true gap, starving the tracking spin-window and forcing
+  // most frames through recovery.
+  static uint32_t learned_gap_cycles = 8000000UL;  // 50 ms
 #endif
   if (frameSize == 33)
     MISO_frame[0] = 0xAA;
@@ -245,7 +248,7 @@ static byte MOSI_frame[33];
   const uint32_t BIT_BANG_TIMEOUT_CYCLES = 4000000UL;  // 25 ms
   // Sanity bounds for learned_gap_cycles updates from observed gaps.
   const uint32_t LEARNED_GAP_MIN         = 4000000UL;  // 25 ms
-  const uint32_t LEARNED_GAP_MAX         = 7200000UL;  // 45 ms
+  const uint32_t LEARNED_GAP_MAX         = 9600000UL;  // 60 ms (was 45 ms — too tight; rejected real ~49 ms WF-RAC gaps)
 
   const uint32_t sck_mask  = (1 << SCK_PIN);
   const uint32_t mosi_mask = (1 << MOSI_PIN);
@@ -420,18 +423,20 @@ static byte MOSI_frame[33];
         return err_msg_timeout_SCK_high;
       }
     }
-    // SCK just fell. If we entered via tracking, refine learned_gap_cycles
-    // from the actual anchor → fall interval. Sanity-check rejects bogus
-    // observations (e.g. multi-cycle drift after a recovery sequence).
+    // SCK just fell. Refine learned_gap_cycles from the actual anchor → fall
+    // interval. We update on BOTH tracking and recovery success: the sanity
+    // check rejects bogus observations (multi-frame skips, boot, post-wrap).
+    // Updating only on tracking-success kept EMA frozen whenever recovery
+    // dominated — the exact failure mode in run-6 (rs=599 vs ts=166).
+    const uint32_t observed_gap = MHI_GET_CCOUNT() - prev_anchor;
+    cnt.last_obs_gap = observed_gap;
     if (entered_via_tracking) {
-      const uint32_t observed_gap = MHI_GET_CCOUNT() - prev_anchor;
-      cnt.last_obs_gap = observed_gap;
       cnt.d_success_track++;
-      if (observed_gap >= LEARNED_GAP_MIN && observed_gap <= LEARNED_GAP_MAX) {
-        learned_gap_cycles = (learned_gap_cycles * 7 + observed_gap) / 8;
-      }
     } else {
       cnt.d_success_recover++;
+    }
+    if (observed_gap >= LEARNED_GAP_MIN && observed_gap <= LEARNED_GAP_MAX) {
+      learned_gap_cycles = (learned_gap_cycles * 7 + observed_gap) / 8;
     }
   }
 
