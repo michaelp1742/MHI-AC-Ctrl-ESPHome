@@ -2,6 +2,7 @@
 // implements the core functions (read & write SPI)
 
 #include "MHI-AC-Ctrl-core.h"
+#include "esphome/core/log.h"
 
 #ifdef ESP8266
 #include <c_types.h>
@@ -26,6 +27,35 @@
   __asm__ __volatile__("rsr %0,ccount" : "=a" (c)); c;}))
 
 #endif // ESP8266
+
+#ifdef ESP8266
+// Phase debug counters — emitted via ESP_LOGI every N loop() calls.
+struct PhaseCounters {
+  uint32_t calls;
+  uint32_t b_track_too_early;
+  uint32_t b_track_stale;
+  uint32_t b_track_not_in_lead;
+  uint32_t b_track_spin;
+  uint32_t b_track_passed;
+  uint32_t b_recovery;
+  uint32_t b_recovery_timeout;
+  uint32_t c_sck_low_track;
+  uint32_t c_sck_low_recover;
+  uint32_t d_timeout_track;
+  uint32_t d_timeout_recover;
+  uint32_t d_success_track;
+  uint32_t d_success_recover;
+  uint32_t e_timeout_high;
+  uint32_t e_timeout_low;
+  uint32_t g_sig;
+  uint32_t g_chk;
+  uint32_t frames_ok;
+  uint32_t last_obs_gap;
+  uint32_t last_fall_elapsed;
+  uint32_t last_learned_gap;
+};
+static PhaseCounters cnt = {};
+#endif
 
 volatile bool ota_in_progress = false;
 
@@ -179,9 +209,106 @@ static byte MOSI_frame[33];
 
    
   call_counter++;
-  // === Phase A — Build MISO frame (NMI free) ===
-  // Pure computation; safe to run before frame-start detection because the
-  // timing anchor (Phase F) is the source of truth for frame sync.
+
+#ifdef ESP8266
+  cnt.calls++;
+  // Periodic phase-counter summary. Roughly every 200 calls = ~2 s during
+  // healthy 20 fps tracking, ~2 s during error cascades (ESPHome calls at
+  // ~100 Hz when loop returns fast).
+  if (cnt.calls % 200 == 0) {
+    cnt.last_learned_gap = learned_gap_cycles;
+    ESP_LOGI("mhi.dbg",
+      "calls=%u ok=%u B[te=%u st=%u nl=%u sp=%u pa=%u rec=%u rto=%u] "
+      "C[t=%u r=%u] D[tt=%u rt=%u ts=%u rs=%u] E[h=%u l=%u] G[s=%u c=%u] "
+      "lg=%u og=%u fe=%u",
+      cnt.calls, cnt.frames_ok,
+      cnt.b_track_too_early, cnt.b_track_stale, cnt.b_track_not_in_lead,
+      cnt.b_track_spin, cnt.b_track_passed, cnt.b_recovery, cnt.b_recovery_timeout,
+      cnt.c_sck_low_track, cnt.c_sck_low_recover,
+      cnt.d_timeout_track, cnt.d_timeout_recover,
+      cnt.d_success_track, cnt.d_success_recover,
+      cnt.e_timeout_high, cnt.e_timeout_low,
+      cnt.g_sig, cnt.g_chk,
+      cnt.last_learned_gap, cnt.last_obs_gap, cnt.last_fall_elapsed);
+  }
+
+  // === Phase B — Pick entry mode (tracking or recovery) ===
+  // MUST run before Phase A so early-return paths don't mutate doubleframe /
+  // frame / opdataNo / new_*. Mutating those at ESPHome's loop rate (instead
+  // of MHI's 20 fps frame rate) silently drops set commands and corrupts the
+  // DB14 toggle the AC uses to identify alternating frames.
+  // Constants in CPU cycles at 160 MHz (see plan for rationale).
+  const uint32_t GAP_25_PCT_CYCLES       = 1600000UL;  // 10 ms
+  const uint32_t RECOVERY_SLACK          = 1600000UL;  // 10 ms
+  const uint32_t NMI_LEAD_CYCLES         =  160000UL;  //  1 ms
+  const uint32_t FALL_TIMEOUT_CYCLES     = 8000000UL;  // 50 ms (recovery exits at gap+5ms; cap must clear gap-5ms with margin)
+  const uint32_t BIT_BANG_TIMEOUT_CYCLES = 4000000UL;  // 25 ms
+  // Sanity bounds for learned_gap_cycles updates from observed gaps.
+  const uint32_t LEARNED_GAP_MIN         = 4000000UL;  // 25 ms
+  const uint32_t LEARNED_GAP_MAX         = 7200000UL;  // 45 ms
+
+  const uint32_t sck_mask  = (1 << SCK_PIN);
+  const uint32_t mosi_mask = (1 << MOSI_PIN);
+  const uint32_t miso_mask = (1 << MISO_PIN);
+  uint32_t saved_ps = 0;
+  // Snapshot anchor before Phase F overwrites it; Phase D uses this to derive
+  // observed_gap when the entry was via tracking mode.
+  const uint32_t prev_anchor = last_frame_end_ccount;
+  bool entered_via_tracking = false;
+
+  if (last_frame_end_valid) {
+    // Tracking mode: anchor valid, predict next falling edge from CCOUNT.
+    entered_via_tracking = true;
+    uint32_t since_gap_start = MHI_GET_CCOUNT() - last_frame_end_ccount;
+
+    if (since_gap_start < GAP_25_PCT_CYCLES) {
+      cnt.b_track_too_early++;
+      return 0;  // too early in gap; yield to ESPHome (not an error)
+    }
+    if (since_gap_start > learned_gap_cycles + RECOVERY_SLACK) {
+      cnt.b_track_stale++;
+      last_frame_end_valid = false;
+      return 0;  // anchor stale; recovery on next call
+    }
+    const uint32_t target = last_frame_end_ccount + learned_gap_cycles - NMI_LEAD_CYCLES;
+    const int32_t signed_until_target = (int32_t)(target - MHI_GET_CCOUNT());
+    if (signed_until_target > (int32_t)NMI_LEAD_CYCLES) {
+      cnt.b_track_not_in_lead++;
+      return 0;  // not yet in lead window; yield
+    }
+    if (signed_until_target > 0) {
+      cnt.b_track_spin++;
+      // Spin briefly (NMI free) to lead point ~1 ms before predicted falling edge.
+      while ((int32_t)(MHI_GET_CCOUNT() - target) < 0) {
+        // spin; NMI fires freely
+      }
+    } else {
+      cnt.b_track_passed++;
+    }
+    // fall through to Phase A → C/D
+  } else {
+    // Recovery mode: existing 5 ms stable-high detection (NMI free).
+    cnt.b_recovery++;
+    int SCKMillis = millis();
+    while (millis() - SCKMillis < 5) {
+      if (!digitalRead(SCK_PIN))
+        SCKMillis = millis();
+      if (millis() - startMillis > max_time_ms) {
+        cnt.b_recovery_timeout++;
+        return err_msg_timeout_SCK_low;
+      }
+    }
+    // fall through to Phase A → C/D
+  }
+#endif
+
+  // === Phase A — Build MISO frame ===
+  // For ESP8266: only reached when Phase B committed to exchange, so state
+  // mutates exactly once per actual frame (matches v2 semantics). Still NMI
+  // free; the ~5–10 µs of computation between Phase B and Phase C is well
+  // within the 1 ms NMI lead margin.
+  // For ESP32: runs unconditionally — frame-start detection in the #else
+  // branch always commits.
   doubleframe = !doubleframe;             // toggle every frame
   MISO_frame[DB14] = doubleframe << 2;    // MISO_frame[DB14] bit2 toggles with every frame
 
@@ -266,63 +393,6 @@ static byte MOSI_frame[33];
   }
 
 #ifdef ESP8266
-  // === Phase B — Pick entry mode (tracking or recovery) ===
-  // Constants in CPU cycles at 160 MHz (see plan for rationale).
-  const uint32_t GAP_25_PCT_CYCLES       = 1600000UL;  // 10 ms
-  const uint32_t RECOVERY_SLACK          = 1600000UL;  // 10 ms
-  const uint32_t NMI_LEAD_CYCLES         =  160000UL;  //  1 ms
-  const uint32_t FALL_TIMEOUT_CYCLES     = 8000000UL;  // 50 ms (recovery exits at gap+5ms; cap must clear gap-5ms with margin)
-  const uint32_t BIT_BANG_TIMEOUT_CYCLES = 4000000UL;  // 25 ms
-  // Sanity bounds for learned_gap_cycles updates from observed gaps.
-  const uint32_t LEARNED_GAP_MIN         = 4000000UL;  // 25 ms
-  const uint32_t LEARNED_GAP_MAX         = 7200000UL;  // 45 ms
-
-  const uint32_t sck_mask  = (1 << SCK_PIN);
-  const uint32_t mosi_mask = (1 << MOSI_PIN);
-  const uint32_t miso_mask = (1 << MISO_PIN);
-  uint32_t saved_ps = 0;
-  // Snapshot anchor before Phase F overwrites it; Phase D uses this to derive
-  // observed_gap when the entry was via tracking mode.
-  const uint32_t prev_anchor = last_frame_end_ccount;
-  bool entered_via_tracking = false;
-
-  if (last_frame_end_valid) {
-    // Tracking mode: anchor valid, predict next falling edge from CCOUNT.
-    entered_via_tracking = true;
-    uint32_t since_gap_start = MHI_GET_CCOUNT() - last_frame_end_ccount;
-
-    if (since_gap_start < GAP_25_PCT_CYCLES) {
-      return 0;  // too early in gap; yield to ESPHome (not an error)
-    }
-    if (since_gap_start > learned_gap_cycles + RECOVERY_SLACK) {
-      last_frame_end_valid = false;
-      return 0;  // anchor stale; recovery on next call
-    }
-    const uint32_t target = last_frame_end_ccount + learned_gap_cycles - NMI_LEAD_CYCLES;
-    const int32_t signed_until_target = (int32_t)(target - MHI_GET_CCOUNT());
-    if (signed_until_target > (int32_t)NMI_LEAD_CYCLES) {
-      return 0;  // not yet in lead window; yield
-    }
-    if (signed_until_target > 0) {
-      // Spin briefly (NMI free) to lead point ~1 ms before predicted falling edge.
-      while ((int32_t)(MHI_GET_CCOUNT() - target) < 0) {
-        // spin; NMI fires freely
-      }
-    }
-    // else: target already passed (learned_gap under-estimates actual);
-    // fall through to Phase C and let Phase D wait for the real edge.
-  } else {
-    // Recovery mode: existing 5 ms stable-high detection (NMI free).
-    int SCKMillis = millis();
-    while (millis() - SCKMillis < 5) {
-      if (!digitalRead(SCK_PIN))
-        SCKMillis = millis();
-      if (millis() - startMillis > max_time_ms)
-        return err_msg_timeout_SCK_low;
-    }
-    // fall through to Phase C
-  }
-
   // === Phase C — Block NMI, verify SCK still high ===
   if (!ota_in_progress) {
     saved_ps = xt_rsil(15);
@@ -330,6 +400,8 @@ static byte MOSI_frame[33];
   if (!(MHI_GPIO_IN & sck_mask)) {
     // SCK already low: NMI fired between Phase B end and xt_rsil, or anchor
     // mispredicted. Don't send garbage MISO; recover next call.
+    if (entered_via_tracking) cnt.c_sck_low_track++;
+    else cnt.c_sck_low_recover++;
     if (!ota_in_progress) xt_wsr_ps(saved_ps);
     last_frame_end_valid = false;
     return err_msg_invalid_signature;
@@ -340,6 +412,9 @@ static byte MOSI_frame[33];
     const uint32_t fall_start = MHI_GET_CCOUNT();
     while (MHI_GPIO_IN & sck_mask) {
       if ((MHI_GET_CCOUNT() - fall_start) > FALL_TIMEOUT_CYCLES) {
+        cnt.last_fall_elapsed = MHI_GET_CCOUNT() - fall_start;
+        if (entered_via_tracking) cnt.d_timeout_track++;
+        else cnt.d_timeout_recover++;
         if (!ota_in_progress) xt_wsr_ps(saved_ps);
         last_frame_end_valid = false;
         return err_msg_timeout_SCK_high;
@@ -350,9 +425,13 @@ static byte MOSI_frame[33];
     // observations (e.g. multi-cycle drift after a recovery sequence).
     if (entered_via_tracking) {
       const uint32_t observed_gap = MHI_GET_CCOUNT() - prev_anchor;
+      cnt.last_obs_gap = observed_gap;
+      cnt.d_success_track++;
       if (observed_gap >= LEARNED_GAP_MIN && observed_gap <= LEARNED_GAP_MAX) {
         learned_gap_cycles = (learned_gap_cycles * 7 + observed_gap) / 8;
       }
+    } else {
+      cnt.d_success_recover++;
     }
   }
 
@@ -451,6 +530,8 @@ static byte MOSI_frame[33];
   bb_exit:
     if (!ota_in_progress) xt_wsr_ps(saved_ps);
     last_frame_end_valid = false;
+    if (err == err_msg_timeout_SCK_high) cnt.e_timeout_high++;
+    else cnt.e_timeout_low++;
     return err;
   bb_done: ;
   }
@@ -495,12 +576,14 @@ static byte MOSI_frame[33];
   if (((MOSI_frame[SB0] & 0xfe) != 0x6c) | (MOSI_frame[SB1] != 0x80) | (MOSI_frame[SB2] != 0x04)) {
 #ifdef ESP8266
     last_frame_end_valid = false;
+    cnt.g_sig++;
 #endif
     return err_msg_invalid_signature;
   }
   if ((MOSI_frame[CBH] << 8 | MOSI_frame[CBL]) != checksum) {
 #ifdef ESP8266
     last_frame_end_valid = false;
+    cnt.g_chk++;
 #endif
     return err_msg_invalid_checksum;
   }
@@ -510,10 +593,15 @@ static byte MOSI_frame[33];
     if ( MOSI_frame[CBL2] != lowByte(checksum ) ) {
 #ifdef ESP8266
       last_frame_end_valid = false;
+      cnt.g_chk++;
 #endif
       return err_msg_invalid_checksum;
     }
   }
+
+#ifdef ESP8266
+  cnt.frames_ok++;
+#endif
 
   if (new_datapacket_received) {
 
