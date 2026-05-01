@@ -31,7 +31,7 @@
 #ifdef ESP8266
 // Bump on every behavioral change; appears in every mhi.dbg log line so we
 // can confirm at runtime which build is actually flashed.
-#define MHI_DBG_VERSION "v3.4"
+#define MHI_DBG_VERSION "v3.5"
 
 // Phase debug counters — emitted via ESP_LOGI every N loop() calls.
 struct PhaseCounters {
@@ -247,7 +247,7 @@ static byte MOSI_frame[33];
   // Constants in CPU cycles at 160 MHz (see plan for rationale).
   const uint32_t GAP_25_PCT_CYCLES       = 1600000UL;  // 10 ms
   const uint32_t RECOVERY_SLACK          = 1600000UL;  // 10 ms
-  const uint32_t NMI_LEAD_CYCLES         =  320000UL;  //  2 ms (was 1 ms — too narrow vs ~10 ms ESPHome poll period; B[sp] hit rate ~1%)
+  const uint32_t NMI_LEAD_CYCLES         = 1920000UL;  // 12 ms (was 2 ms — still too narrow; v3.4 run-3.4 B[sp]=3.1%, B[rec]=33%; widen past ESPHome ~10 ms poll period so every poll lands in window)
   const uint32_t FALL_TIMEOUT_CYCLES     = 8000000UL;  // 50 ms (recovery exits at gap+5ms; cap must clear gap-5ms with margin)
   const uint32_t BIT_BANG_TIMEOUT_CYCLES = 4000000UL;  // 25 ms
   // Sanity bounds for learned_gap_cycles updates from observed gaps.
