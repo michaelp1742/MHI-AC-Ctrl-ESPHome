@@ -31,7 +31,7 @@
 #ifdef ESP8266
 // Bump on every behavioral change; appears in every mhi.dbg log line so we
 // can confirm at runtime which build is actually flashed.
-#define MHI_DBG_VERSION "v3.3"
+#define MHI_DBG_VERSION "v3.4"
 
 // Phase debug counters — emitted via ESP_LOGI every N loop() calls.
 struct PhaseCounters {
@@ -247,7 +247,7 @@ static byte MOSI_frame[33];
   // Constants in CPU cycles at 160 MHz (see plan for rationale).
   const uint32_t GAP_25_PCT_CYCLES       = 1600000UL;  // 10 ms
   const uint32_t RECOVERY_SLACK          = 1600000UL;  // 10 ms
-  const uint32_t NMI_LEAD_CYCLES         =  160000UL;  //  1 ms
+  const uint32_t NMI_LEAD_CYCLES         =  320000UL;  //  2 ms (was 1 ms — too narrow vs ~10 ms ESPHome poll period; B[sp] hit rate ~1%)
   const uint32_t FALL_TIMEOUT_CYCLES     = 8000000UL;  // 50 ms (recovery exits at gap+5ms; cap must clear gap-5ms with margin)
   const uint32_t BIT_BANG_TIMEOUT_CYCLES = 4000000UL;  // 25 ms
   // Sanity bounds for learned_gap_cycles updates from observed gaps.
@@ -428,19 +428,21 @@ static byte MOSI_frame[33];
       }
     }
     // SCK just fell. Refine learned_gap_cycles from the actual anchor → fall
-    // interval. We update on BOTH tracking and recovery success: the sanity
-    // check rejects bogus observations (multi-frame skips, boot, post-wrap).
-    // Updating only on tracking-success kept EMA frozen whenever recovery
-    // dominated — the exact failure mode in run-6 (rs=599 vs ts=166).
+    // interval. Update only on tracking-success: recovery's anchor is the
+    // 5 ms stable-high detection point, which lags the true frame edge by an
+    // unknown amount, biasing observed_gap short. Run-7 (v3.3) included
+    // recovery in EMA and lg converged ~3 ms below true gap, causing constant
+    // -4 timeouts. Tracking-success samples (D[ts] ~ 9% of calls) are enough
+    // for EMA to converge once MAX is wide enough to admit them.
     const uint32_t observed_gap = MHI_GET_CCOUNT() - prev_anchor;
     cnt.last_obs_gap = observed_gap;
     if (entered_via_tracking) {
       cnt.d_success_track++;
+      if (observed_gap >= LEARNED_GAP_MIN && observed_gap <= LEARNED_GAP_MAX) {
+        learned_gap_cycles = (learned_gap_cycles * 7 + observed_gap) / 8;
+      }
     } else {
       cnt.d_success_recover++;
-    }
-    if (observed_gap >= LEARNED_GAP_MIN && observed_gap <= LEARNED_GAP_MAX) {
-      learned_gap_cycles = (learned_gap_cycles * 7 + observed_gap) / 8;
     }
   }
 
