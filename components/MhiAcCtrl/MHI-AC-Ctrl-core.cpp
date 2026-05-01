@@ -29,6 +29,10 @@
 #endif // ESP8266
 
 #ifdef ESP8266
+// Bump on every behavioral change; appears in every mhi.dbg log line so we
+// can confirm at runtime which build is actually flashed.
+#define MHI_DBG_VERSION "v3.3"
+
 // Phase debug counters — emitted via ESP_LOGI every N loop() calls.
 struct PhaseCounters {
   uint32_t calls;
@@ -221,7 +225,7 @@ static byte MOSI_frame[33];
   if (cnt.calls % 200 == 0) {
     cnt.last_learned_gap = learned_gap_cycles;
     ESP_LOGI("mhi.dbg",
-      "calls=%u ok=%u B[te=%u st=%u nl=%u sp=%u pa=%u rec=%u rto=%u] "
+      "build=" MHI_DBG_VERSION " calls=%u ok=%u B[te=%u st=%u nl=%u sp=%u pa=%u rec=%u rto=%u] "
       "C[t=%u r=%u] D[tt=%u rt=%u ts=%u rs=%u] E[h=%u l=%u] G[s=%u c=%u] "
       "lg=%u og=%u fe=%u",
       cnt.calls, cnt.frames_ok,
